@@ -59,7 +59,7 @@ def detect_company_llm(issue: str, subject: str) -> tuple[str, float]:
             model=MIMO_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
-            max_tokens=200,
+            max_tokens=2000,
         )
 
         content = response.choices[0].message.content.strip()

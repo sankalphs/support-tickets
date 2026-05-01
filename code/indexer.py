@@ -63,7 +63,7 @@ async def generate_synthetic_questions(
                 model=MIMO_MODEL,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.7,
-                max_tokens=500,
+                max_tokens=2000,
             )
 
             content = response.choices[0].message.content.strip()
@@ -275,14 +275,10 @@ def store_in_chroma(embedded_questions: list[dict], articles: list[dict]) -> Non
 
     logger.info("Stored %d synthetic question embeddings in ChromaDB", len(ids))
 
-    # Also store full article content for retrieval
-    # Map doc_id -> article content
+    # Store parent documents as a separate JSON file (not in ChromaDB)
+    # because ChromaDB requires embeddings for all items in a collection
     article_map = {a["doc_id"]: a for a in articles}
-
-    # Store parent documents (one per unique doc_id)
-    parent_ids = []
-    parent_docs = []
-    parent_metas = []
+    parent_store = {}
     seen_doc_ids = set()
 
     for q in embedded_questions:
@@ -293,27 +289,21 @@ def store_in_chroma(embedded_questions: list[dict], articles: list[dict]) -> Non
 
         article = article_map.get(doc_id)
         if article:
-            parent_ids.append(doc_id)
-            parent_docs.append(article["content"][:10000])  # ChromaDB has size limits
-            parent_metas.append(
-                {
-                    "company": article["company"],
-                    "product_area": article["product_area"],
-                    "title": article["title"],
-                    "source_url": article.get("source_url", ""),
-                    "is_parent_doc": True,
-                }
-            )
+            parent_store[doc_id] = {
+                "doc_id": doc_id,
+                "content": article["content"][:10000],
+                "company": article["company"],
+                "product_area": article["product_area"],
+                "title": article["title"],
+                "source_url": article.get("source_url", ""),
+            }
 
-    for i in range(0, len(parent_ids), batch_size):
-        end = min(i + batch_size, len(parent_ids))
-        collection.add(
-            ids=parent_ids[i:end],
-            documents=parent_docs[i:end],
-            metadatas=parent_metas[i:end],
-        )
+    # Save parent store to disk
+    parent_store_path = os.path.join(os.path.dirname(CHROMA_DIR), "parent_store.json")
+    with open(parent_store_path, "w", encoding="utf-8") as f:
+        json.dump(parent_store, f)
 
-    logger.info("Stored %d parent documents in ChromaDB", len(parent_ids))
+    logger.info("Stored %d parent documents in parent_store.json", len(parent_store))
 
 
 async def run_indexing() -> None:

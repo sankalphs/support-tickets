@@ -1,6 +1,8 @@
 """Hybrid BM25 + Vector retrieval with RRF fusion."""
 
+import json
 import logging
+import os
 
 import chromadb
 from openai import OpenAI
@@ -50,12 +52,21 @@ class HybridRetriever:
         )
 
     def _build_bm25_index(self) -> None:
-        """Build BM25 index from all documents in ChromaDB."""
-        # Get all documents from Chroma
+        """Build BM25 index from synthetic questions in ChromaDB + parent doc titles."""
+        # Get all synthetic questions from ChromaDB
         results = self.collection.get(include=["documents", "metadatas"])
 
-        self.bm25_doc_ids = results["ids"]
-        self.bm25_contents = results["documents"]
+        self.bm25_doc_ids = []
+        self.bm25_contents = []
+
+        # Map synthetic questions to their parent doc_ids
+        for i, doc_id in enumerate(results["ids"]):
+            meta = results["metadatas"][i]
+            parent_doc_id = meta.get("doc_id", doc_id)
+            content = results["documents"][i]
+
+            self.bm25_doc_ids.append(parent_doc_id)
+            self.bm25_contents.append(content)
 
         # Tokenize for BM25
         tokenized = [doc.lower().split() for doc in self.bm25_contents]
@@ -195,20 +206,35 @@ class HybridRetriever:
         return doc_ids, confidence
 
     def get_parent_documents(self, doc_ids: list[str]) -> list[dict]:
-        """Get full document content from ChromaDB by doc_id."""
+        """Get full document content from parent_store.json by doc_id."""
         if not doc_ids:
             return []
 
-        results = self.collection.get(ids=doc_ids, include=["documents", "metadatas"])
+        parent_store_path = os.path.join(
+            os.path.dirname(CHROMA_DIR), "parent_store.json"
+        )
+        if not os.path.exists(parent_store_path):
+            logger.warning("Parent store not found: %s", parent_store_path)
+            return []
+
+        with open(parent_store_path, encoding="utf-8") as f:
+            parent_store = json.load(f)
 
         docs = []
-        for i, doc_id in enumerate(results["ids"]):
-            docs.append(
-                {
-                    "doc_id": doc_id,
-                    "content": results["documents"][i],
-                    "metadata": results["metadatas"][i],
-                }
-            )
+        for doc_id in doc_ids:
+            doc = parent_store.get(doc_id)
+            if doc:
+                docs.append(
+                    {
+                        "doc_id": doc_id,
+                        "content": doc["content"],
+                        "metadata": {
+                            "company": doc["company"],
+                            "product_area": doc["product_area"],
+                            "title": doc["title"],
+                            "source_url": doc.get("source_url", ""),
+                        },
+                    }
+                )
 
         return docs

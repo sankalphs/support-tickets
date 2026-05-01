@@ -37,7 +37,7 @@ def get_llm_client() -> OpenAI:
     return OpenAI(api_key=MIMO_API_KEY, base_url=MIMO_BASE_URL)
 
 
-def call_llm(prompt: str, max_tokens: int = 1000) -> str:
+def call_llm(prompt: str, max_tokens: int = 2000) -> str:
     """Call MiMo LLM and return response text."""
     client = get_llm_client()
     response = client.chat.completions.create(
@@ -111,7 +111,7 @@ def expand_queries_node(state: dict) -> dict:
         prompt = QUERY_EXPANSION_PROMPT.format(
             ticket_text=issue, subject=subject or "N/A"
         )
-        response = call_llm(prompt, max_tokens=300)
+        response = call_llm(prompt, max_tokens=2000)
         result = extract_json(response)
         queries = result.get("queries", [])
 
@@ -228,7 +228,7 @@ def classify_node(state: dict) -> dict:
     )
 
     try:
-        response = call_llm(prompt, max_tokens=500)
+        response = call_llm(prompt, max_tokens=2000)
         result = extract_json(response)
 
         classification = {
@@ -283,7 +283,7 @@ def generate_response_node(state: dict) -> dict:
     )
 
     try:
-        response = call_llm(prompt, max_tokens=1000)
+        response = call_llm(prompt, max_tokens=3000)
         result = extract_json(response)
 
         return {
@@ -320,7 +320,7 @@ def generate_escalation_node(state: dict) -> dict:
     )
 
     try:
-        response = call_llm(prompt, max_tokens=500)
+        response = call_llm(prompt, max_tokens=2000)
         result = extract_json(response)
 
         classification = state.get("classification", {})
