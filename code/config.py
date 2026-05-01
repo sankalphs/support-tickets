@@ -38,7 +38,7 @@ TOP_K_VECTOR = 20
 TOP_K_BM25 = 20
 TOP_K_FINAL = 5
 RRF_K = 60  # RRF constant
-CONFIDENCE_THRESHOLD = 0.4
+CONFIDENCE_THRESHOLD = 0.02  # RRF scores are typically 0.01-0.15
 
 # Allowed Values
 ALLOWED_STATUSES = ["replied", "escalated"]

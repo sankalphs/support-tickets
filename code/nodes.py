@@ -156,10 +156,12 @@ def retrieve_node(state: dict) -> dict:
 
 def check_confidence_node(state: dict) -> dict:
     """Check retrieval confidence, auto-escalate if too low."""
+    from config import CONFIDENCE_THRESHOLD
+
     confidence = state.get("retrieval_confidence", 0.0)
     docs = state.get("retrieved_docs", [])
 
-    if not docs or confidence < 0.4:
+    if not docs or confidence < CONFIDENCE_THRESHOLD:
         logger.warning("Low confidence (%.4f), auto-escalating", confidence)
         return {
             **state,

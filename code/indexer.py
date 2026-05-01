@@ -14,6 +14,7 @@ from tqdm import tqdm
 from config import (
     CHECKPOINT_FILE,
     CHROMA_DIR,
+    DB_DIR,
     INDEX_CONCURRENCY,
     MIMO_API_KEY,
     MIMO_BASE_URL,
@@ -163,21 +164,47 @@ async def generate_all_synthetic_questions(
 
 
 def embed_questions_batch(questions: list[dict]) -> list[dict]:
-    """Embed questions using NVIDIA API with rate limiting.
+    """Embed questions using NVIDIA API with rate limiting and incremental ChromaDB storage.
 
     Returns list of {embedding, ...question_metadata}.
     """
     from openai import OpenAI
 
+    # Load embedding checkpoint
+    embed_checkpoint_path = os.path.join(DB_DIR, "embed_checkpoint.json")
+    if os.path.exists(embed_checkpoint_path):
+        with open(embed_checkpoint_path, encoding="utf-8") as f:
+            embed_checkpoint = json.load(f)
+        start_offset = embed_checkpoint.get("completed_count", 0)
+        logger.info("Resuming embedding from offset %d", start_offset)
+    else:
+        start_offset = 0
+
+    # Initialize ChromaDB for incremental storage
+    chroma_client = chromadb.PersistentClient(path=CHROMA_DIR)
+    try:
+        collection = chroma_client.get_or_create_collection(
+            "support_docs",
+            metadata={"hnsw:space": "cosine"},
+        )
+    except Exception:
+        chroma_client.delete_collection("support_docs")
+        collection = chroma_client.create_collection(
+            "support_docs",
+            metadata={"hnsw:space": "cosine"},
+        )
+
     client = OpenAI(api_key=NVIDIA_API_KEY, base_url=NVIDIA_BASE_URL)
-    embedded = []
 
     # Process in batches respecting rate limit (40/min)
-    batch_size = 30  # Leave some headroom
-    delay_between_batches = 60.0 / NVIDIA_RPM * batch_size + 1  # ~46 seconds
+    batch_size = 30
+    delay_between_batches = 60.0 / NVIDIA_RPM * batch_size + 1
 
-    for i in range(0, len(questions), batch_size):
-        batch = questions[i : i + batch_size]
+    remaining = questions[start_offset:]
+    total_done = start_offset
+
+    for i in range(0, len(remaining), batch_size):
+        batch = remaining[i : i + batch_size]
         texts = [q["question"] for q in batch]
 
         try:
@@ -188,15 +215,36 @@ def embed_questions_batch(questions: list[dict]) -> list[dict]:
                 extra_body={"input_type": "passage", "truncate": "NONE"},
             )
 
+            # Store directly to ChromaDB
+            ids = []
+            embeddings = []
+            documents = []
+            metadatas = []
+
             for j, emb_data in enumerate(response.data):
-                question_obj = batch[j].copy()
-                question_obj["embedding"] = emb_data.embedding
-                embedded.append(question_obj)
+                q = batch[j]
+                doc_id = f"sq_{q['doc_id']}_{start_offset + i + j}"
+                ids.append(doc_id)
+                embeddings.append(emb_data.embedding)
+                documents.append(q["question"])
+                metadatas.append(
+                    {
+                        "doc_id": q["doc_id"],
+                        "company": q["company"],
+                        "product_area": q["product_area"],
+                        "title": q["title"],
+                        "source_url": q.get("source_url", ""),
+                        "is_synthetic_question": True,
+                    }
+                )
+
+            collection.add(
+                ids=ids, embeddings=embeddings, documents=documents, metadatas=metadatas
+            )
 
         except Exception as e:
             logger.error("Embedding batch failed at offset %d: %s", i, e)
-            # Retry individual questions
-            for q in batch:
+            for j, q in enumerate(batch):
                 try:
                     response = client.embeddings.create(
                         input=[q["question"]],
@@ -204,84 +252,55 @@ def embed_questions_batch(questions: list[dict]) -> list[dict]:
                         encoding_format="float",
                         extra_body={"input_type": "passage", "truncate": "NONE"},
                     )
-                    question_obj = q.copy()
-                    question_obj["embedding"] = response.data[0].embedding
-                    embedded.append(question_obj)
-                except Exception as e2:
-                    logger.error(
-                        "Individual embedding failed for %s: %s", q["question"][:50], e2
+                    doc_id = f"sq_{q['doc_id']}_{start_offset + i + j}"
+                    collection.add(
+                        ids=[doc_id],
+                        embeddings=[response.data[0].embedding],
+                        documents=[q["question"]],
+                        metadatas=[
+                            {
+                                "doc_id": q["doc_id"],
+                                "company": q["company"],
+                                "product_area": q["product_area"],
+                                "title": q["title"],
+                                "source_url": q.get("source_url", ""),
+                                "is_synthetic_question": True,
+                            }
+                        ],
                     )
+                except Exception as e2:
+                    logger.error("Individual embedding failed: %s", e2)
+
+        # Save checkpoint
+        total_done = start_offset + min(i + batch_size, len(remaining))
+        with open(embed_checkpoint_path, "w", encoding="utf-8") as f:
+            json.dump({"completed_count": total_done}, f)
 
         # Rate limit delay
-        if i + batch_size < len(questions):
+        if i + batch_size < len(remaining):
             logger.info(
                 "Embedded %d/%d questions, waiting %.1fs for rate limit...",
-                min(i + batch_size, len(questions)),
+                total_done,
                 len(questions),
                 delay_between_batches,
             )
             time.sleep(delay_between_batches)
 
-    return embedded
+    logger.info("All %d questions embedded and stored in ChromaDB", total_done)
+    return []  # Not needed anymore, stored directly
 
 
-def store_in_chroma(embedded_questions: list[dict], articles: list[dict]) -> None:
-    """Store embedded questions and parent documents in ChromaDB."""
-    client = chromadb.PersistentClient(path=CHROMA_DIR)
+def store_in_chroma(articles: list[dict], questions: list[dict]) -> None:
+    """Store parent documents in parent_store.json.
 
-    # Delete existing collection if present
-    try:
-        client.delete_collection("support_docs")
-    except Exception:
-        pass
-
-    collection = client.create_collection(
-        "support_docs",
-        metadata={"hnsw:space": "cosine"},
-    )
-
-    # Store synthetic question embeddings
-    ids = []
-    embeddings = []
-    documents = []
-    metadatas = []
-
-    for i, q in enumerate(embedded_questions):
-        doc_id = f"sq_{q['doc_id']}_{i}"
-        ids.append(doc_id)
-        embeddings.append(q["embedding"])
-        documents.append(q["question"])
-        metadatas.append(
-            {
-                "doc_id": q["doc_id"],
-                "company": q["company"],
-                "product_area": q["product_area"],
-                "title": q["title"],
-                "source_url": q.get("source_url", ""),
-                "is_synthetic_question": True,
-            }
-        )
-
-    # Batch insert (ChromaDB has limits)
-    batch_size = 5000
-    for i in range(0, len(ids), batch_size):
-        end = min(i + batch_size, len(ids))
-        collection.add(
-            ids=ids[i:end],
-            embeddings=embeddings[i:end],
-            documents=documents[i:end],
-            metadatas=metadatas[i:end],
-        )
-
-    logger.info("Stored %d synthetic question embeddings in ChromaDB", len(ids))
-
-    # Store parent documents as a separate JSON file (not in ChromaDB)
-    # because ChromaDB requires embeddings for all items in a collection
+    Synthetic question embeddings are already stored during embed_questions_batch.
+    """
+    # Store parent documents as a separate JSON file
     article_map = {a["doc_id"]: a for a in articles}
     parent_store = {}
     seen_doc_ids = set()
 
-    for q in embedded_questions:
+    for q in questions:
         doc_id = q["doc_id"]
         if doc_id in seen_doc_ids:
             continue
@@ -299,7 +318,7 @@ def store_in_chroma(embedded_questions: list[dict], articles: list[dict]) -> Non
             }
 
     # Save parent store to disk
-    parent_store_path = os.path.join(os.path.dirname(CHROMA_DIR), "parent_store.json")
+    parent_store_path = os.path.join(DB_DIR, "parent_store.json")
     with open(parent_store_path, "w", encoding="utf-8") as f:
         json.dump(parent_store, f)
 
@@ -318,12 +337,16 @@ async def run_indexing() -> None:
     questions = await generate_all_synthetic_questions(articles)
     logger.info("Generated %d synthetic questions", len(questions))
 
-    # Step 3: Embed questions
+    # Step 3: Embed questions (stores directly to ChromaDB)
     logger.info("Embedding questions with NVIDIA API...")
-    embedded = embed_questions_batch(questions)
-    logger.info("Embedded %d questions", len(embedded))
+    embed_questions_batch(questions)
 
-    # Step 4: Store in ChromaDB
-    logger.info("Storing in ChromaDB...")
-    store_in_chroma(embedded, articles)
+    # Step 4: Store parent documents
+    logger.info("Storing parent documents...")
+    store_in_chroma(articles, questions)
     logger.info("Indexing complete!")
+
+    # Clean up embedding checkpoint
+    embed_checkpoint_path = os.path.join(DB_DIR, "embed_checkpoint.json")
+    if os.path.exists(embed_checkpoint_path):
+        os.remove(embed_checkpoint_path)
