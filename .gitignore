@@ -31,3 +31,6 @@ data/index/
 data/embeddings/
 *.sqlite
 *.db
+code/.db/
+code/.db/**
+index_checkpoint.json
